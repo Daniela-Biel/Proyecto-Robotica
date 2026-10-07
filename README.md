@@ -1,312 +1,251 @@
-# Robot Drawing — Sistema de procesamiento de imágenes (V1)
+# Robot Drawing — De una foto a trayectorias para el robot (V2)
 
-Sistema de visión por computadora que convierte la fotografía de un dibujo
-hecho a mano en trayectorias 2D (`strokes`) que, en una fase futura, un
-robot podría usar para reproducir el dibujo con un lápiz.
+Sistema de visión por computadora que convierte una **fotografía de una
+persona** (o de un dibujo de líneas) en **trayectorias 2D en milímetros**
+listas para que un robot las dibuje con cinemática inversa (IK).
 
-**Esta V1 NO controla ningún robot.** Su único objetivo es resolver:
+> **V2:** se agrega el modo `face` (retratos), que es ahora el modo por
+> defecto, y una etapa final `robot_path`. Esta etapa genera strokes cortos
+> con waypoints densos, en mm y ordenados, y los exporta a un CSV que se lee
+> directamente desde MATLAB.
 
-> "¿Cómo convierto las líneas de esta imagen en trayectorias 2D?"
+![Validación V1 vs V2](docs/validacion_caras.jpg)
 
-No intenta responder "¿qué objeto representa este dibujo?" — el sistema es
-puramente geométrico, no semántico.
-
----
-
-## 1. Objetivo del proyecto
-
-Dada una fotografía de un dibujo simple (figuras geométricas, casas,
-estrellas, bocetos con líneas) sobre una hoja blanca, el sistema:
-
-1. Preprocesa la imagen (grises, blur, contraste, binarización).
-2. Segmenta y limpia el trazo del ruido de fondo.
-3. Detecta líneas usando una de tres estrategias intercambiables
-   (contornos, bordes o esqueletización).
-4. Extrae trayectorias continuas (`strokes`).
-5. Simplifica cada trayectoria a un número reducido de puntos relevantes.
-6. Convierte a coordenadas 2D (píxeles y, opcionalmente, milímetros).
-7. Exporta el resultado a JSON/CSV y genera imágenes de cada etapa.
+*Columnas: foto (normal / oscura / iluminación lateral); resultado de la V1;
+trayectoria nueva (cada color es un stroke y las líneas grises son los
+traslados con el lápiz arriba); simulación de lo que dibujará el robot.*
 
 ---
 
-## 2. Arquitectura
+## 1. Por qué la V1 no servía para caras
 
-```text
-robot_drawing/
-│
-├── main.py                      # CLI: orquesta el pipeline paso a paso
-├── config.py                    # TODOS los parámetros configurables
-├── requirements.txt
-├── README.md
-│
-├── image_processing/
-│   ├── preprocess.py            # carga, grises, blur, contraste, threshold, perspectiva
-│   ├── segmentation.py          # limpieza morfológica de la máscara binaria
-│   ├── skeleton.py              # skeletonization + skeleton -> strokes
-│   ├── strokes.py               # despachador de estrategias (contours/edges/skeleton)
-│   ├── simplification.py        # Ramer-Douglas-Peucker (cv2.approxPolyDP)
-│   └── coordinates.py           # px -> mm, export JSON/CSV
-│
-├── visualization/
-│   └── visualize.py             # guarda imágenes de cada etapa
-│
-├── input/                       # imágenes de entrada
-└── output/                      # resultados generados (imágenes, JSON, CSV)
-```
+La V1 estaba pensada para **dibujos de líneas oscuras sobre papel blanco**.
+Al validarla con fotos de caras se encontraron estos problemas:
 
-Cada módulo es independiente: recibe y devuelve arrays de NumPy o
-estructuras de datos simples (listas de puntos, diccionarios), sin
-depender de los demás módulos más que lo estrictamente necesario. Esto
-permite sustituir una estrategia (por ejemplo, cambiar cómo se hace la
-simplificación) sin reescribir el resto del proyecto.
-
-`main.py` **no** oculta el pipeline detrás de una única función
-`process_image()`: cada etapa se invoca explícitamente para poder
-inspeccionar o depurar cualquier paso de forma aislada.
+| Problema en V1 | Causa | Solución en V2 |
+|---|---|---|
+| La foto se vuelve manchas blancas y negras (traje, pelo, sombras) | El threshold global (Otsu) separa regiones claras y oscuras, no líneas | **XDoG** (diferencia de Gaussianas): responde a líneas y rasgos finos, no a regiones |
+| El skeleton dibuja el "eje medio" de las manchas, que es una red de líneas sin sentido | Skeleton aplicado a regiones gruesas | Skeleton solo sobre líneas finas |
+| El fondo (cortinas, banderas, paredes) se dibuja igual que la cara | No hay noción de persona/fondo | **Detección de cara** (Haar) + recorte + **GrabCut** para eliminar el fondo, sea del color que sea |
+| Con luz lateral o fotos oscuras el resultado cambia por completo | Umbral fijo frente a la iluminación | **Normalización de iluminación**: flat-field + CLAHE, y umbral por percentil |
+| Ojos, nariz y boca apenas aparecen | El pelo y la ropa "se comen" las líneas | **Umbral propio** para la zona de rasgos (`FACE_FEATURE_BOOST`) |
+| Strokes de cientos de mm y puntos separados por muchos mm | Solo se simplificaba con RDP | `robot_path`: longitud máxima por stroke y distancia máxima entre waypoints |
+| La conversión a mm deformaba la imagen (escala X ≠ escala Y) | Escala independiente por eje | Escala **uniforme**, imagen centrada y eje Y hacia arriba |
+| El JSON en mm truncaba las coordenadas a enteros | Se aplicaba `int()` también a los mm | Corregido: los mm conservan 3 decimales |
+| `main.py` no corría | Importaba `image_processing/` y `visualization/`, pero los archivos estaban sueltos | Los módulos se movieron a esos paquetes |
 
 ---
 
-## 3. Instalación
+## 2. Instalación
 
 Requiere Python 3.9+.
 
 ```bash
-cd robot_drawing
 python3 -m venv venv
-source venv/bin/activate       # En Windows: venv\Scripts\activate
+source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## 4. Dependencias
+> Usar **OpenCV 4.x** (`<5.0`): la 5.0 ya no trae los modelos Haar de
+> detección de cara.
 
-- `opencv-python-headless` — procesamiento de imagen (blur, threshold,
-  contornos, Canny, approxPolyDP, morfología).
-- `numpy` — manejo de arrays.
-- `scikit-image` — skeletonization (`skimage.morphology.skeletonize`).
-- `matplotlib` — disponible para análisis/visualización adicional (no es
-  estrictamente necesaria para el pipeline actual, pero se incluye para
-  facilitar exploración interactiva de resultados).
+En **Raspberry Pi** (Raspberry Pi OS de 64 bits) basta con lo mismo, porque
+`opencv-python-headless` publica wheels para aarch64. El pipeline no usa
+redes neuronales. En una PC tarda de 0.6 a 2 s por foto; en una Pi 4/5
+se esperan unos segundos (no se ha medido aún).
 
 ---
 
-## 5. Cómo ejecutar
+## 3. Uso
 
-Coloca tu imagen en `input/` (o usa cualquier ruta) y ejecuta:
-
-```bash
-python main.py --input input/dibujo.png
-```
-
-Elegir estrategia de extracción de líneas:
+### Retrato (modo por defecto)
 
 ```bash
-python main.py --input input/dibujo.png --method skeleton
-python main.py --input input/dibujo.png --method contours
-python main.py --input input/dibujo.png --method edges
+python main.py --input input/foto.jpg
 ```
 
-Comparar las tres estrategias en una sola ejecución (genera
-`output/contours/`, `output/edges/`, `output/skeleton/`):
-
-```bash
-python main.py --input input/dibujo.png --method all
-```
-
-Ajustar simplificación y threshold:
-
-```bash
-python main.py --input input/dibujo.png --epsilon 3.0 --threshold 140 --threshold-method fixed
-```
-
-Otras opciones útiles:
+Opciones útiles:
 
 ```text
---output-dir DIR             Directorio de salida (default: output/)
---physical-width-mm N        Ancho físico representado por la imagen (mm)
---physical-height-mm N       Alto físico representado por la imagen (mm)
---no-intermediate            No guardar imágenes intermedias (solo el resultado final)
+--detail N             % de la persona marcado como línea (default 7). Más alto =
+                       más detalle y más tiempo de dibujo. Rango típico: 4-12
+--max-stroke-mm N      longitud máxima de un stroke (default 30 mm, 0 = sin límite)
+--max-segment-mm N     distancia máxima entre waypoints (default 1 mm)
+--min-stroke-mm N      descarta strokes más cortos (default 1.5 mm)
+--physical-width-mm    ancho del área de dibujo (default 200)
+--physical-height-mm   alto del área de dibujo (default 150)
+--keep-background      no eliminar el fondo
+--no-outline           no dibujar la silueta cabeza/hombros
+--no-intermediate      solo guardar el resultado final
 ```
 
-### Ejemplo real (incluido en este repo)
-
-Se incluye una imagen sintética de prueba en `input/dibujo_casa.png`
-(una casa con puerta, ventana circular y una estrella) para validar la
-instalación:
+### Validar con muchas fotos a la vez
 
 ```bash
-python main.py --input input/dibujo_casa.png --method all
+python validate.py --input-dir fotos_prueba/ --output-dir output/validacion
 ```
 
-Deberías obtener una salida de consola similar a:
+Genera `contact_sheet.jpg` (foto | líneas | dibujo final de cada imagen) y
+`summary.csv` (strokes, waypoints, tiempo estimado, si se detectó la cara,
+etc.). **Recomendado:** probar con fotos de la cámara real que se va a usar.
 
-```text
-====================================
-RESULTADO
-====================================
+### Dibujos de líneas (modo V1)
 
-Imagen: dibujo_casa.png
-
-Dimensiones:
-1000 x 700 px
-
-Método:
-contours
-
-Strokes detectados:
-13
-
-Puntos antes de simplificación:
-5040
-
-Puntos después de simplificación:
-102
-
-Reducción:
-98.0%
-
-Longitud total aproximada de trayectorias:
-5421.8 px
-
-Archivos de salida en: output/contours
-====================================
+```bash
+python main.py --input input/dibujo_casa.png --mode drawing --method skeleton
+python main.py --input input/dibujo_casa.png --mode drawing --method all
 ```
 
 ---
 
-## 6. Estructura de carpetas de salida
+## 4. Pipeline del modo `face`
 
-Por cada ejecución (o por cada método, en modo `--method all`) se genera:
+| # | Etapa | Módulo | Imagen de salida |
+|---|---|---|---|
+| 1 | Detección de la cara más grande (Haar frontal → perfil) | `face.detect_face` | `02_face_detection.png` |
+| 2 | Recorte cabeza+cuello y escalado a 600 px de alto | `face.crop_portrait` | `03_crop.png` |
+| 3 | Persona vs fondo (GrabCut inicializado con la cara) | `face.segment_foreground` | `04_foreground.png` |
+| 4 | Iluminación uniforme (flat-field + CLAHE) | `face.normalize_illumination` | `05_illumination.png` |
+| 5 | Líneas XDoG + silueta + limpieza | `face.extract_line_mask` | `06_lines.png` |
+| 6 | Skeleton → strokes en px | `skeleton.py` | `07_skeleton.png`, `08_strokes.png` |
+| 7 | Trayectoria del robot (ver §5) | `robot_path.py` | `09_robot_path.png`, `10_final_trajectory.png` |
+
+Si no se detecta ninguna cara, se usa la imagen completa sin eliminar el
+fondo y se imprime un aviso.
+
+Si el resultado no se ve bien, revisa las imágenes en orden para ubicar en
+qué etapa se degrada.
+
+---
+
+## 5. Trayectoria para el robot (`robot_path`, ambos modos)
+
+Con IK el controlador solo recibe los waypoints y entre dos de ellos
+interpola, normalmente en espacio articular. **Entre dos puntos lejanos esa
+interpolación no es una recta en el papel.** Por eso:
+
+1. **Suavizado** (`SMOOTH_WINDOW_PX`): quita el escalón de píxel del
+   skeleton, que haría vibrar el brazo.
+2. **Orden + unión** (vecino más cercano, invirtiendo strokes cuando
+   conviene): reduce los traslados con el lápiz arriba y une strokes cuyos
+   extremos casi se tocan (`JOIN_GAP_PX`).
+3. **px → mm** con escala uniforme, centrado en el área, Y hacia arriba y
+   origen configurable (`DRAWING_ORIGIN_MM`) para que las coordenadas ya
+   queden en el marco del robot.
+4. **Descarte** de strokes < `MIN_STROKE_LENGTH_MM` (ruido que solo cuesta
+   subidas de lápiz).
+5. **RDP en mm** (`ROBOT_SIMPLIFY_EPSILON_MM`).
+6. **Strokes cortos**: los mayores a `MAX_STROKE_LENGTH_MM` se parten. El
+   tramo siguiente empieza exactamente donde terminó el anterior.
+7. **Densificación**: ningún segmento mide más de `MAX_SEGMENT_MM`.
+
+Al final se imprime un resumen para validar antes de dibujar: strokes,
+waypoints, segmento y stroke más largos, caja envolvente en mm y tiempo
+estimado.
+
+### Archivos de salida
 
 ```text
 output/
-├── 01_original.png            # imagen de entrada, sin modificar
-├── 02_perspective.png         # tras corrección de perspectiva (o igual a 01 si no aplica)
-├── 03_grayscale.png           # escala de grises
-├── 04_threshold.png           # máscara binaria (trazo = blanco)
-├── 05_cleaned.png             # máscara tras limpieza morfológica
-├── 06_edges.png                # solo si method == "edges"
-├── 07_skeleton.png             # solo si method == "skeleton"
-├── 08_strokes.png             # strokes crudos (antes de simplificar) sobre la imagen original
-├── 09_simplified.png          # puntos tras simplificación, sobre la imagen original
-├── 10_final_trajectory.png    # imagen final: original + trayectorias
-├── trajectories.json          # trayectorias en píxeles
-├── trajectories_mm.json       # trayectorias convertidas a milímetros
-└── trajectories.csv           # stroke_id, point_id, x, y (en píxeles)
+├── robot_waypoints.csv      <- PARA MATLAB: stroke_id, x_mm, y_mm, pen
+├── trajectories_mm.json     strokes en mm + metadatos (área, origen, métricas)
+├── 01..10_*.png             imagen de cada etapa
+└── trajectories.json/.csv   (solo modo drawing) strokes en px, formato V1
 ```
 
+`robot_waypoints.csv` tiene una fila por waypoint, **en orden de
+ejecución**:
+
+- `pen = 0`: ir a ese punto con el lápiz **arriba** (es el primer punto de
+  cada stroke).
+- `pen = 1`: ir a ese punto **dibujando**.
+
 ---
 
-## 7. Qué hace cada etapa
+## 6. MATLAB y Raspberry Pi
 
-| Etapa | Módulo | Descripción |
+`matlab/cargar_trayectoria.m` lee el CSV con `readmatrix`, grafica la
+trayectoria, verifica que todos los puntos estén dentro del espacio de
+trabajo y resuelve la IK punto a punto. Trae una IK de ejemplo para un
+brazo planar de 2 eslabones; reemplázala por la de su robot.
+
+**Ojo con la arquitectura:** MATLAB **no corre nativamente en la Raspberry
+Pi** (no hay MATLAB para Linux ARM). Las opciones habituales son:
+
+- **MATLAB en una PC + Raspberry Pi como "brazo ejecutor"**, con el
+  *MATLAB Support Package for Raspberry Pi Hardware*: MATLAB corre en la PC
+  y controla los GPIO/PWM/I2C de la Pi por red.
+- **Generar código** desde MATLAB/Simulink (MATLAB Coder / Simulink Coder)
+  y desplegarlo en la Pi para que corra solo.
+- **Python en la Pi** (este pipeline más un controlador en Python) y MATLAB
+  solo para diseño y simulación.
+
+En cualquiera de los casos `robot_waypoints.csv` sirve como interfaz entre
+la visión y el control.
+
+---
+
+## 7. Parámetros principales (`config.py`)
+
+| Parámetro | Default | Efecto |
 |---|---|---|
-| Preprocesamiento | `image_processing/preprocess.py` | Carga la imagen, corrige perspectiva (si hay esquinas configuradas), convierte a grises, reduce ruido (Gaussian Blur), ajusta contraste y binariza. |
-| Segmentación | `image_processing/segmentation.py` | Cierra pequeños huecos y elimina ruido puntual mediante operaciones morfológicas y filtrado de componentes conexos pequeños. |
-| Detección de líneas + extracción de strokes | `image_processing/strokes.py`, `image_processing/skeleton.py` | Convierte la máscara limpia en una lista de trayectorias (`strokes`), usando una de tres estrategias intercambiables. |
-| Simplificación | `image_processing/simplification.py` | Reduce el número de puntos de cada stroke con Ramer-Douglas-Peucker (`cv2.approxPolyDP`), controlado por `SIMPLIFICATION_EPSILON`. |
-| Coordenadas | `image_processing/coordinates.py` | Mantiene las coordenadas en píxeles y provee una conversión explícita e independiente a milímetros. Exporta JSON/CSV. |
-| Visualización | `visualization/visualize.py` | Guarda una imagen por cada etapa relevante del pipeline. |
-
-### Las tres estrategias de detección de líneas
-
-- **`contours`** (`cv2.findContours`): rápido y robusto para formas
-  cerradas o con relleno de línea gruesa. Tiende a generar un contorno
-  "doble" (por ambos lados del trazo) en líneas abiertas dibujadas a
-  mano, ya que trabaja sobre regiones, no sobre líneas de 1 px.
-- **`edges`** (`cv2.Canny` + contornos sobre el mapa de bordes): útil
-  cuando el contraste es irregular. Suele generar más strokes y más
-  puntos que `contours`, porque Canny puede producir bordes discontinuos.
-- **`skeleton`** (`skimage.morphology.skeletonize`): reduce cada trazo a
-  su eje central de 1 px de ancho — evita la duplicación de línea que
-  ocurre con `contours`, pero es más sensible a fragmentarse en cruces
-  de líneas (ver limitaciones).
-
-No hay una estrategia "correcta" universal: el diseño permite ejecutar
-`--method all` y comparar visualmente los resultados en `output/*/`.
+| `LINE_PERCENTILE` (`--detail`) | 7 | Cantidad de líneas. Más = más detalle y más tiempo |
+| `FACE_FEATURE_BOOST` | 1.8 | Detalle extra en ojos/nariz/boca respecto al resto |
+| `XDOG_SIGMA` | 1.6 | Escala de los rasgos. Más alto = líneas más gruesas y menos detalle fino |
+| `FACE_CROP_MARGINS` | (0.55, 0.55, 0.65, 0.55) | Cuánto de pelo/hombros entra en el recorte |
+| `FACE_DRAW_OUTLINE` | True | Dibujar la silueta de la persona |
+| `PHYSICAL_WIDTH/HEIGHT_MM` | 200 × 150 | Área de dibujo |
+| `DRAWING_ORIGIN_MM`, `FLIP_Y` | (0,0), True | Marco de coordenadas del robot |
+| `MAX_STROKE_LENGTH_MM` | 30 | Longitud máxima de un stroke |
+| `MAX_SEGMENT_MM` | 1.0 | Distancia máxima entre waypoints |
+| `MIN_STROKE_LENGTH_MM` | 1.5 | Filtro de ruido |
+| `PEN_*_SPEED`, `PEN_LIFT_TIME_S` | 20, 50 mm/s; 0.6 s | Solo para estimar el tiempo |
 
 ---
 
-## 8. Cómo cambiar de estrategia
+## 8. Validación realizada
 
-Dos formas:
+Se probaron 5 retratos con fondos distintos (cortinas rojas y bandera, fondo
+gris liso, pared con textura, cortina azul, interior) en 3 variantes de
+iluminación cada uno: normal, **oscura** (gamma 2.2 × 0.55 + ruido) y
+**lateral** (gradiente 0.2 → 1.25 de izquierda a derecha). Son 15 imágenes,
+más una sin cara.
 
-1. **Por CLI** (recomendado para experimentar): `--method contours|edges|skeleton|all`.
-2. **Por defecto en `config.py`**: cambiar `LINE_EXTRACTION_METHOD`.
-
-Para agregar una nueva estrategia en el futuro, basta con:
-1. Implementar una función `extract_strokes_from_X(...)` en `strokes.py`
-   (o un módulo nuevo) que devuelva `List[List[Tuple[int, int]]]`.
-2. Agregar el nuevo caso al `if/elif` de `extract_strokes()` en
-   `strokes.py`.
-
-No es necesario tocar `main.py`, `simplification.py` ni `coordinates.py`.
-
----
-
-## 9. Cómo interpretar los archivos de salida
-
-- **Imágenes `0X_*.png`**: revisar en orden. Si el resultado final se ve
-  mal, revisa las imágenes intermedias en orden para ubicar en qué etapa
-  se degrada (por ejemplo: si `04_threshold.png` ya se ve mal, el
-  problema está en el threshold/iluminación, no en la detección de
-  líneas).
-- **`trajectories.json`**: estructura principal, en píxeles. Cada
-  `stroke` es una trayectoria continua (el robot "baja el lápiz" al
-  inicio y lo "sube" al final). Preparada para agregar en el futuro `z`,
-  `pen_down`/`pen_up`, velocidad, etc.
-- **`trajectories_mm.json`**: mismas trayectorias convertidas a
-  milímetros usando `PHYSICAL_WIDTH_MM`/`PHYSICAL_HEIGHT_MM` (o los
-  argumentos `--physical-width-mm`/`--physical-height-mm`).
-- **`trajectories.csv`**: mismos datos en formato tabular
-  (`stroke_id,point_id,x,y`), útil para inspección rápida en Excel/Sheets
-  o para depuración con `pandas`.
+- Se detectó la cara en las 15 imágenes con cara. La imagen sin cara cae
+  correctamente al modo de imagen completa.
+- En las 15 imágenes: segmento máximo ≤ 1.00 mm, stroke máximo ≤ 30 mm y
+  todo dentro del área. Cada retrato da entre 76 y 132 strokes y entre
+  980 y 1300 waypoints, con 1.5 a 2.3 min de dibujo estimados. El
+  procesamiento tarda de 0.6 a 2 s por foto en una PC.
+- Las variantes oscura y lateral producen dibujos casi iguales a la normal.
+- El resultado es determinista (misma foto, mismo CSV).
+- Pruebas unitarias de `robot_path`: `python -m pytest tests/`.
 
 ---
 
-## 10. Limitaciones actuales (V1)
+## 9. Limitaciones conocidas
 
-- **Sin detección automática de esquinas del papel**: la corrección de
-  perspectiva solo se aplica si se proveen manualmente las 4 esquinas en
-  `config.PERSPECTIVE_CORNERS`. Si no se proveen, se omite este paso.
-- **Cruces de líneas**: ninguna de las tres estrategias resuelve
-  perfectamente una "X" o cruces densos de líneas. El resultado puede
-  fragmentarse en más strokes de los "estéticamente ideales", aunque
-  sigue siendo geométricamente válido.
-- **Orden de los strokes**: es simplemente el orden en que se descubren
-  durante el recorrido/escaneo. No hay optimización de ruta (tipo
-  "traveling salesman") para minimizar desplazamientos del lápiz — esto
-  quedará para una fase posterior.
-- **Conversión px→mm simplificada**: asume una escala lineal
-  independiente en X e Y a partir del tamaño total de la imagen; no
-  corrige distorsiones de lente ni variaciones de escala dentro de la
-  misma imagen.
-- **No hay reconocimiento semántico**: el sistema no sabe que un conjunto
-  de líneas forma una "casa"; solo extrae geometría. Esto es
-  intencional (ver principio fundamental del proyecto).
-- **Solo trazos oscuros sobre fondo claro**: el pipeline asume alto
-  contraste trazo/papel. Colores complejos, acuarelas o sombreados
-  extensos no están soportados en esta V1.
+- **Una sola persona**: si hay varias caras se dibuja la más grande.
+- **Fondo muy parecido a la piel o al pelo** (por ejemplo, una pared beige
+  con luz fuerte): GrabCut puede dejar un trozo de fondo pegado a la cabeza,
+  que aparece en la silueta. En ese caso usar `--no-outline`, o mejor,
+  fotografiar sobre un fondo que contraste.
+- **Caras de perfil o muy giradas**: la cascada de perfil ayuda, pero la
+  detección es menos fiable que de frente.
+- **Pelo con mucha textura** genera muchos strokes cortos. Bajar `--detail`
+  o subir `--min-stroke-mm` si el tiempo de dibujo es excesivo.
+- El estilo es de **contorno/boceto**, no de sombreado (no hay hatching).
+- La IK de MATLAB es un ejemplo: el código no se ejecutó en MATLAB dentro
+  de este proyecto.
 
----
+## 10. Próximos pasos sugeridos
 
-## 11. Próximos pasos recomendados
-
-1. **Detección automática de las esquinas del papel** (por ejemplo,
-   buscando el contorno de mayor área con 4 vértices) para automatizar
-   `correct_perspective`.
-2. **Mejor manejo de cruces en `skeleton.py`**: usar un análisis de
-   grafo más sofisticado (por ejemplo, `networkx`) para decidir cómo
-   continuar un stroke a través de una unión, en vez de la heurística de
-   "vecino más alineado con la dirección de avance".
-3. **Optimización de orden de strokes** (nearest-neighbor o similar)
-   para minimizar el recorrido total del lápiz entre trayectorias.
-4. **Calibración de cámara** más precisa para la conversión píxeles→mm
-   (usar un patrón de calibración conocido en vez de asumir el tamaño de
-   la hoja).
-5. **Pruebas con fotografías reales** (no solo imágenes sintéticas) para
-   ajustar `BLUR_KERNEL_SIZE`, `THRESHOLD_METHOD`, `MIN_COMPONENT_AREA` y
-   `SIMPLIFICATION_EPSILON` a condiciones reales de iluminación y cámara.
-6. **Fase 2 del proyecto** (fuera de alcance de esta V1): integrar
-   control real del robot (motores, G-code o comunicación serial),
-   cinemática, y el manejo de `pen_down`/`pen_up` ya previsto en la
-   estructura del JSON.
+1. Probar con fotos reales de la cámara y del montaje definitivos, y ajustar
+   `--detail` y el área de dibujo.
+2. Medir los tiempos en la Raspberry Pi.
+3. Ajustar `MAX_SEGMENT_MM` según el error real del robot. Si la
+   interpolación se hace en espacio cartesiano, puede subirse.
+4. Si se quiere más estilo: hatching en zonas oscuras (pelo, sombras) como
+   strokes adicionales.
+5. Si GrabCut falla seguido con su fondo: usar un segmentador ligero
+   (por ejemplo, MediaPipe Selfie Segmentation, que corre en la Pi).

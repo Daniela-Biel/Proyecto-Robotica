@@ -1,4 +1,8 @@
+# OpenCV 4.x: la 5.0 ya no incluye los archivos Haar (cv2.data.haarcascades)
+# que usa la deteccion de cara.
 opencv-python-headless>=4.8,<5.0
-numpy>=1.24,<2.0
-scikit-image>=0.21,<0.23
+numpy>=1.24,<3
+scikit-image>=0.21,<1.0
+# Opcional (exploracion interactiva / pruebas)
 matplotlib>=3.7,<4.0
+pytest>=7

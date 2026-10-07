@@ -80,7 +80,13 @@ def strokes_to_dict(
         data["strokes"].append(
             {
                 "id": idx,
-                "points": [[int(x), int(y)] for x, y in stroke],
+                # Sin int(): esta funcion tambien serializa strokes en mm,
+                # y truncar a entero perderia toda la resolucion sub-mm.
+                "points": [
+                    [x if isinstance(x, int) else round(float(x), 3),
+                     y if isinstance(y, int) else round(float(y), 3)]
+                    for x, y in stroke
+                ],
             }
         )
 

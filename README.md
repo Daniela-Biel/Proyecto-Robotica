@@ -17,6 +17,29 @@ traslados con el lápiz arriba); simulación de lo que dibujará el robot.*
 
 ---
 
+## Estructura del repositorio
+
+```text
+├── main.py                 CLI: foto -> trayectoria (modos face y drawing)
+├── validate.py             validación por lotes (hoja de contacto + summary.csv)
+├── config.py               todos los parámetros
+├── image_processing/
+│   ├── face.py             cara, recorte, fondo, iluminación, líneas XDoG
+│   ├── skeleton.py         skeleton -> strokes en px
+│   ├── robot_path.py       strokes px -> trayectoria en mm para IK + export CSV
+│   ├── segmentation.py     limpieza de máscaras
+│   └── preprocess.py, strokes.py, simplification.py, coordinates.py   (modo drawing)
+├── visualization/visualize.py   imágenes de cada etapa
+├── matlab/cargar_trayectoria.m  lectura del CSV + IK de ejemplo
+├── tests/                  pruebas (python -m pytest tests/)
+├── input/                  imágenes de entrada
+├── docs/                   figuras de validación
+├── V1/                     resultados y README de la V1 (solo referencia)
+└── output/                 resultados generados (ignorado por git)
+```
+
+---
+
 ## 1. Por qué la V1 no servía para caras
 
 La V1 estaba pensada para **dibujos de líneas oscuras sobre papel blanco**.

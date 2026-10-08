@@ -9,10 +9,11 @@ se cumple: un threshold global convierte la foto en manchas (pelo, ropa,
 sombras, fondo) y el skeleton de una mancha es su "eje medio", no una
 linea que tenga sentido dibujar.
 
-Este modulo resuelve el problema en 5 pasos, todos con OpenCV clasico
-(sin redes neuronales, para que corra en una Raspberry Pi):
+Este modulo resuelve el problema en 5 pasos con OpenCV (el unico modelo
+es YuNet, un detector de caras de 230 KB que corre en una Raspberry Pi):
 
-    1. detect_face()            -> rectangulo de la cara (Haar cascade).
+    1. detect_face()            -> cara + 5 puntos (ojos, nariz, comisuras)
+                                   con YuNet; Haar como respaldo.
     2. crop_portrait()          -> recorte cabeza + cuello y tamano fijo.
     3. segment_foreground()     -> mascara persona/fondo (GrabCut), para
                                    no dibujar el fondo sin importar su color.
@@ -29,6 +30,7 @@ resto del pipeline.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import cv2
@@ -37,6 +39,29 @@ import numpy as np
 import config
 
 Rect = Tuple[int, int, int, int]  # (x, y, w, h)
+
+
+@dataclass
+class Face:
+    """Cara detectada.
+
+    rect: caja CUADRADA (x, y, w, h) con la geometria de una deteccion Haar
+        (frente a barbilla, mejilla a mejilla). Todos los margenes y zonas
+        del modulo estan definidos respecto a esta caja.
+    landmarks: array 5x2 (x, y) = ojo derecho, ojo izquierdo, punta de la
+        nariz, comisura derecha, comisura izquierda (derecha/izquierda de la
+        persona). None si la cara vino del detector Haar.
+    """
+
+    rect: Rect
+    landmarks: Optional[np.ndarray] = None
+
+    def roll_deg(self) -> float:
+        """Inclinacion de la cabeza (grados) segun la linea de los ojos."""
+        if self.landmarks is None:
+            return 0.0
+        (rx, ry), (lx, ly) = self.landmarks[0], self.landmarks[1]
+        return float(np.degrees(np.arctan2(ly - ry, lx - rx)))
 
 
 # ---------------------------------------------------------------------------
@@ -48,17 +73,39 @@ def _load_cascade(name: str) -> Optional[cv2.CascadeClassifier]:
     return None if cascade.empty() else cascade
 
 
-def detect_face(image: np.ndarray) -> Optional[Rect]:
-    """Detecta la cara MAS GRANDE de la imagen. Devuelve (x, y, w, h) o None.
+def _detect_yunet(image: np.ndarray) -> Optional[Face]:
+    """YuNet (OpenCV FaceDetectorYN): tolera cabeza inclinada, cara
+    parcialmente tapada (selfie con celular) y mala iluminacion, y devuelve
+    los 5 puntos de referencia. None si no hay modelo o no encuentra cara."""
+    model = config.YUNET_MODEL_PATH
+    if not hasattr(cv2, "FaceDetectorYN") or not model.exists():
+        return None
+    h, w = image.shape[:2]
+    # YuNet trabaja mejor a ~640 px; se escala y se regresa a la original.
+    scale = min(1.0, 640.0 / max(h, w))
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else image
+    detector = cv2.FaceDetectorYN.create(
+        str(model), "", (small.shape[1], small.shape[0]), config.YUNET_SCORE_THRESHOLD, 0.3, 5000
+    )
+    _, faces = detector.detect(small)
+    if faces is None or len(faces) == 0:
+        return None
+    best = max(faces, key=lambda f: f[2] * f[3]) / scale
+    x, y, bw, bh = best[:4]
+    landmarks = best[4:14].reshape(5, 2).astype(np.float32)
 
-    Se ecualiza el histograma antes de detectar para que funcione tambien
-    con fotos oscuras o con contraluz. Se prueban varias cascadas (frontal y
-    perfil) en orden; la primera que encuentre algo gana.
-    """
+    # La caja de YuNet es mas alta y angosta que la de Haar (para la que se
+    # ajustaron margenes y zonas): se convierte a un cuadrado equivalente.
+    side = 1.15 * bw
+    cx, cy = x + bw / 2, y + 0.47 * bh
+    rect = (int(cx - side / 2), int(cy - side / 2), int(side), int(side))
+    return Face(rect, landmarks)
+
+
+def _detect_haar(image: np.ndarray) -> Optional[Face]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     gray = cv2.equalizeHist(gray)
     min_side = max(30, int(min(gray.shape[:2]) * config.FACE_MIN_SIZE_RATIO))
-
     for name in config.FACE_CASCADES:
         cascade = _load_cascade(name)
         if cascade is None:
@@ -68,16 +115,22 @@ def detect_face(image: np.ndarray) -> Optional[Rect]:
         )
         if len(faces) > 0:
             x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
-            return int(x), int(y), int(w), int(h)
+            return Face((int(x), int(y), int(w), int(h)))
     return None
+
+
+def detect_face(image: np.ndarray) -> Optional[Face]:
+    """Detecta la cara MAS GRANDE. Primero YuNet; si no esta disponible o
+    no encuentra nada, cascadas Haar (frontal y perfil)."""
+    return _detect_yunet(image) or _detect_haar(image)
 
 
 # ---------------------------------------------------------------------------
 # 2. Recorte del retrato
 # ---------------------------------------------------------------------------
 def crop_portrait(
-    image: np.ndarray, face: Optional[Rect]
-) -> Tuple[np.ndarray, Optional[Rect], Rect]:
+    image: np.ndarray, face: Optional[Face]
+) -> Tuple[np.ndarray, Optional[Face], Rect]:
     """Recorta la region cabeza + cuello alrededor de la cara y la escala
     a una altura fija (config.FACE_WORK_HEIGHT).
 
@@ -93,7 +146,7 @@ def crop_portrait(
     if face is None:
         x0, y0, x1, y1 = 0, 0, img_w, img_h
     else:
-        fx, fy, fw, fh = face
+        fx, fy, fw, fh = face.rect
         mx_l, mx_r, my_t, my_b = config.FACE_CROP_MARGINS
         x0 = max(0, int(fx - mx_l * fw))
         x1 = min(img_w, int(fx + fw + mx_r * fw))
@@ -110,20 +163,19 @@ def crop_portrait(
 
     face_in_crop = None
     if face is not None:
-        fx, fy, fw, fh = face
-        face_in_crop = (
-            int((fx - x0) * scale),
-            int((fy - y0) * scale),
-            int(fw * scale),
-            int(fh * scale),
-        )
+        fx, fy, fw, fh = face.rect
+        rect = (int((fx - x0) * scale), int((fy - y0) * scale), int(fw * scale), int(fh * scale))
+        lm = None
+        if face.landmarks is not None:
+            lm = (face.landmarks - np.array([x0, y0], np.float32)) * scale
+        face_in_crop = Face(rect, lm)
     return crop, face_in_crop, (x0, y0, x1 - x0, y1 - y0)
 
 
 # ---------------------------------------------------------------------------
 # 3. Segmentacion persona / fondo
 # ---------------------------------------------------------------------------
-def segment_foreground(image: np.ndarray, face: Optional[Rect]) -> np.ndarray:
+def segment_foreground(image: np.ndarray, face: Optional[Face]) -> np.ndarray:
     """Mascara (255 = persona) usando GrabCut inicializado con la cara.
 
     GrabCut modela el color del fondo y de la persona con mezclas de
@@ -141,7 +193,7 @@ def segment_foreground(image: np.ndarray, face: Optional[Rect]) -> np.ndarray:
     if face is None or not config.FACE_REMOVE_BACKGROUND:
         return full
 
-    fx, fy, fw, fh = face
+    fx, fy, fw, fh = face.rect
     cx, cy = fx + fw // 2, fy + fh // 2
 
     mask = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
@@ -246,10 +298,53 @@ def normalize_illumination(image: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # 5. Lineas tipo boceto (XDoG)
 # ---------------------------------------------------------------------------
+def feature_zones(face: Optional[Face], shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Mascaras booleanas (rasgos, ojos) en coordenadas del recorte.
+
+    - rasgos: cejas, ojos, nariz y boca.
+    - ojos: zona pequena alrededor de cada ojo, con umbral aun mas
+      permisivo, porque con lentes el armazon (muy contrastado) opaca al ojo.
+
+    Con landmarks (YuNet) las zonas se construyen a partir de los ojos y la
+    boca, rotadas segun la inclinacion de la cabeza. Sin landmarks (Haar) se
+    usa una elipse fija dentro del rectangulo de la cara y no hay zona de ojos.
+    """
+    features = np.zeros(shape, np.uint8)
+    eyes = np.zeros(shape, np.uint8)
+    if face is None:
+        return features > 0, eyes > 0
+
+    if face.landmarks is None:
+        fx, fy, fw, fh = face.rect
+        cv2.ellipse(features, (fx + fw // 2, fy + int(fh * 0.58)),
+                    (int(fw * 0.40), int(fh * 0.40)), 0, 0, 360, 255, -1)
+        return features > 0, eyes > 0
+
+    lm = face.landmarks
+    eye_r, eye_l = lm[0], lm[1]
+    mouth = (lm[3] + lm[4]) / 2
+    eye_mid = (eye_r + eye_l) / 2
+    d = float(np.linalg.norm(eye_l - eye_r))  # distancia entre ojos
+    angle = face.roll_deg()
+    down = mouth - eye_mid  # direccion "hacia abajo" de la cara
+    down /= max(np.linalg.norm(down), 1e-6)
+
+    # Desde las cejas (~0.45 d sobre los ojos) hasta debajo de la boca.
+    span_top, span_bottom = -0.45 * d, float(np.linalg.norm(mouth - eye_mid)) + 0.35 * d
+    center = eye_mid + down * (span_top + span_bottom) / 2
+    axes = (int(0.95 * d), int((span_bottom - span_top) / 2))
+    cv2.ellipse(features, (int(center[0]), int(center[1])), axes, angle, 0, 360, 255, -1)
+
+    for eye in (eye_r, eye_l):
+        cv2.ellipse(eyes, (int(eye[0]), int(eye[1])), (int(0.38 * d), int(0.22 * d)),
+                    angle, 0, 360, 255, -1)
+    return features > 0, eyes > 0
+
+
 def extract_line_mask(
     gray: np.ndarray,
     foreground: Optional[np.ndarray] = None,
-    face: Optional[Rect] = None,
+    face: Optional[Face] = None,
 ) -> np.ndarray:
     """Lineas oscuras finas (255 = linea) mediante Diferencia de Gaussianas.
 
@@ -260,10 +355,10 @@ def extract_line_mask(
 
     El umbral se fija como percentil de la respuesta DENTRO de la persona,
     asi que se adapta solo a fotos con poco o mucho contraste. Si se conoce
-    la cara, la zona de rasgos (ojos-nariz-boca) usa su PROPIO umbral con
-    un percentil mayor (FACE_FEATURE_BOOST): si no, el pelo y la ropa, que
-    tienen mucha textura, se "comen" el presupuesto de lineas y los rasgos
-    -lo que hace reconocible un retrato- quedan incompletos.
+    la cara, la zona de rasgos y la de ojos usan su PROPIO umbral con un
+    percentil mayor (FACE_FEATURE_BOOST, FACE_EYE_BOOST): si no, el pelo y
+    la ropa, que tienen mucha textura, se "comen" el presupuesto de lineas
+    y los rasgos -lo que hace reconocible un retrato- quedan incompletos.
     """
     g = gray.astype(np.float32) / 255.0
     s = config.XDOG_SIGMA
@@ -272,22 +367,16 @@ def extract_line_mask(
     dog = g1 - config.XDOG_TAU * g2  # < 0 en lineas oscuras
 
     region = foreground > 0 if foreground is not None else np.ones(g.shape, bool)
-
-    features = np.zeros(g.shape, bool)
-    if face is not None:
-        fx, fy, fw, fh = face
-        ellipse = np.zeros(g.shape, np.uint8)
-        cv2.ellipse(
-            ellipse, (fx + fw // 2, fy + int(fh * 0.58)),
-            (int(fw * 0.40), int(fh * 0.40)), 0, 0, 360, 255, -1,
-        )
-        features = (ellipse > 0) & region
+    features, eyes = feature_zones(face, g.shape)
+    eyes &= region
+    features &= region & ~eyes
     rest = region & ~features
 
     lines = np.zeros(g.shape, bool)
     for zone, pct in (
         (rest, config.LINE_PERCENTILE),
         (features, min(50.0, config.LINE_PERCENTILE * config.FACE_FEATURE_BOOST)),
+        (eyes, min(50.0, config.LINE_PERCENTILE * config.FACE_EYE_BOOST)),
     ):
         values = dog[zone]
         if values.size == 0:
@@ -304,6 +393,21 @@ def extract_line_mask(
         )
         lines = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, k)
     return lines
+
+
+def fill_small_holes(lines: np.ndarray, max_area: int) -> np.ndarray:
+    """Rellena huecos chicos dentro de las lineas (reflejos de luz en ojos
+    y lentes). Sin esto el skeleton rodea cada hueco y un ojo termina
+    dibujado como una cadena de burbujas."""
+    if max_area <= 0:
+        return lines
+    holes = cv2.bitwise_not(lines)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=4)
+    small = np.zeros(num, bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] <= max_area
+    out = lines.copy()
+    out[small[labels] & (holes > 0)] = 255
+    return out
 
 
 def foreground_outline(foreground: np.ndarray) -> np.ndarray:

@@ -52,3 +52,27 @@ def test_smooth_keeps_endpoints():
     out = robot_path.smooth_stroke(zigzag, 5)
     assert out[0] == (0.0, 0.0) and out[-1] == (19.0, 1.0)
     assert np.ptp([p[1] for p in out[3:-3]]) < 0.5
+
+
+def test_link_collinear_joins_dashes_but_not_corners():
+    dash1 = [(float(x), 0.0) for x in range(0, 11)]
+    dash2 = [(float(x), 0.0) for x in range(16, 27)]       # mismo renglon, hueco 5
+    perpendicular = [(30.0, float(y)) for y in range(5, 16)]  # cerca pero en angulo recto
+    out = robot_path.link_collinear_strokes([dash2, perpendicular, dash1], 12.0, 30.0)
+    assert len(out) == 2
+    longest = max(out, key=len)
+    xs = sorted([longest[0][0], longest[-1][0]])
+    assert xs == [0.0, 26.0]
+
+
+def test_fill_small_holes():
+    from image_processing import face
+
+    lines = np.zeros((40, 40), np.uint8)
+    lines[5:15, 5:15] = 255
+    lines[8:10, 8:10] = 0          # hueco chico (reflejo) -> se rellena
+    lines[20:38, 20:38] = 255
+    lines[23:35, 23:35] = 0        # hueco grande (ojo) -> se conserva
+    out = face.fill_small_holes(lines, 40)
+    assert out[8:10, 8:10].min() == 255
+    assert out[23:35, 23:35].max() == 0

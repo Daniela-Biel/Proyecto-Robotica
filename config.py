@@ -132,7 +132,16 @@ SIMPLIFIED_POINT_RADIUS = 4
 # (dibujos de lineas sobre papel, comportamiento de la V1).
 PIPELINE_MODE = "face"
 
-# --- Deteccion de cara (Haar cascades incluidas en opencv-python) ---------
+# --- Deteccion de cara -----------------------------------------------------
+# Detector principal: YuNet (OpenCV FaceDetectorYN, modelo de 230 KB en
+# models/). Tolera cabeza inclinada y cara parcialmente tapada, y da la
+# posicion de ojos, nariz y boca. Si no esta disponible se usa Haar.
+YUNET_MODEL_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
+YUNET_SCORE_THRESHOLD = 0.7
+# Si no se detecta ninguna cara: True = error (no dibujar la escena entera);
+# False = usar la imagen completa (se puede forzar con --allow-no-face).
+FACE_REQUIRED = True
+# Respaldo: cascadas Haar incluidas en opencv-python.
 FACE_CASCADES = [
     "haarcascade_frontalface_default.xml",
     "haarcascade_frontalface_alt2.xml",
@@ -172,8 +181,14 @@ XDOG_MIN_RESPONSE = 0.01
 # Multiplicador de LINE_PERCENTILE dentro de la zona de rasgos (ojos, nariz,
 # boca). >1 = mas detalle en la cara que en pelo/ropa.
 FACE_FEATURE_BOOST = 1.8
+# Igual, para una zona chica alrededor de cada ojo (requiere YuNet). Mas alto
+# porque con lentes el armazon opaca al ojo.
+FACE_EYE_BOOST = 3.0
 # Kernel (px) del "closing" que une guiones cortos de una misma linea. 0 = off.
 LINE_CLOSE_KERNEL = 5
+# Huecos dentro de las lineas con area (px) <= esto se rellenan (reflejos
+# en ojos/lentes que el skeleton convertiria en "burbujas"). 0 = off.
+FACE_FILL_HOLES_AREA = 40
 # Componentes de linea con area (px) menor a esto se descartan (motas).
 FACE_MIN_LINE_AREA = 15
 # GrabCut se ejecuta a esta fraccion de la resolucion de trabajo (mas rapido
@@ -196,8 +211,16 @@ FLIP_Y = True
 SMOOTH_WINDOW_PX = 5
 # Strokes cuyos extremos esten a <= esta distancia (px) se unen en uno solo.
 JOIN_GAP_PX = 3.0
+# Union de lineas "en guiones": si el final de un stroke apunta al inicio de
+# otro (hueco <= LINK_GAP_PX y desvio <= LINK_MAX_ANGLE_DEG) se unen,
+# dibujando el hueco. Menos subidas de lapiz. LINK_GAP_PX = 0 desactiva.
+LINK_GAP_PX = 12.0
+LINK_MAX_ANGLE_DEG = 30.0
 # Strokes mas cortos que esto (mm) se descartan (ruido / puntos sueltos).
 MIN_STROKE_LENGTH_MM = 1.5
+# (modo face) Fuera de la zona de rasgos (pelo, mejillas, ropa) los trazos
+# sueltos cortos son casi siempre textura: se exige una longitud mayor.
+MIN_STROKE_LENGTH_OUTSIDE_MM = 4.0
 # Tolerancia RDP en mm (se aplica antes de densificar).
 ROBOT_SIMPLIFY_EPSILON_MM = 0.15
 # Longitud maxima de un stroke (mm). Strokes mas largos se parten. 0 = sin limite.

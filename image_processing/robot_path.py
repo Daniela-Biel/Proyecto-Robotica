@@ -136,6 +136,94 @@ def order_and_join_strokes(
     return [_as_list(s) for s in ordered]
 
 
+def _end_direction(pts: np.ndarray, at_end: bool, k: int = 6) -> np.ndarray:
+    """Direccion (unitaria) hacia AFUERA del stroke en uno de sus extremos."""
+    k = min(k, len(pts) - 1)
+    v = pts[-1] - pts[-1 - k] if at_end else pts[0] - pts[k]
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else v
+
+
+def link_collinear_strokes(
+    strokes: List[StrokeF], max_gap: float, max_angle_deg: float
+) -> List[StrokeF]:
+    """Une strokes "en guiones": si el final de uno apunta hacia el inicio
+    de otro (hueco <= max_gap, desvio <= max_angle_deg), se concatenan y el
+    hueco se dibuja como un tramo recto.
+
+    El XDoG corta las lineas largas (mechones de pelo, contorno de la cara)
+    donde el contraste baja un poco; sin esto cada guion es una subida y
+    bajada de lapiz. Se une primero el par mas cercano (greedy) y se evita
+    formar ciclos.
+    """
+    arrs = [np.asarray(s, dtype=np.float64) for s in strokes if len(s) >= 2]
+    n = len(arrs)
+    if n < 2 or max_gap <= 0:
+        return [_as_list(a) for a in arrs]
+
+    # Extremo e = 2*i (inicio del stroke i) o 2*i + 1 (fin del stroke i)
+    pos = np.array([a[0] if e % 2 == 0 else a[-1] for a in arrs for e in (0, 1)])
+    out = np.array([_end_direction(a, e == 1) for a in arrs for e in (0, 1)])
+
+    diff = pos[None, :, :] - pos[:, None, :]          # vector de i hacia j
+    dist = np.linalg.norm(diff, axis=2)
+    gap_dir = diff / np.maximum(dist, 1e-9)[:, :, None]
+    cos_max = np.cos(np.radians(max_angle_deg))
+    cos_i = np.einsum("ijk,ik->ij", gap_dir, out)     # i apunta hacia j
+    cos_j = np.einsum("ijk,jk->ij", -gap_dir, out)    # j apunta hacia i
+    facing = -(out @ out.T)                           # direcciones opuestas
+    close = dist < 2.0
+    ok = np.where(close, facing > cos_max, (cos_i > cos_max) & (cos_j > cos_max))
+    ok &= dist <= max_gap
+    owner = np.repeat(np.arange(n), 2)
+    ok &= owner[:, None] != owner[None, :]
+    ok = np.triu(ok, 1)
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    link = {}  # extremo -> extremo enlazado
+    ii, jj = np.nonzero(ok)
+    for k in np.argsort(dist[ii, jj], kind="stable"):
+        a, b = int(ii[k]), int(jj[k])
+        if a in link or b in link:
+            continue
+        ra, rb = find(a // 2), find(b // 2)
+        if ra == rb:
+            continue
+        parent[ra] = rb
+        link[a], link[b] = b, a
+
+    # Reconstruir cadenas empezando por strokes con un extremo libre
+    done = [False] * n
+    result: List[StrokeF] = []
+    for start in range(n):
+        if done[start]:
+            continue
+        if 2 * start in link and 2 * start + 1 in link:
+            continue  # esta en medio de una cadena: se visita desde un extremo
+        # Orientar para que el extremo libre sea el inicio
+        free_start = 2 * start not in link
+        idx, entry = start, (2 * start if free_start else 2 * start + 1)
+        chain = []
+        while True:
+            done[idx] = True
+            a = arrs[idx] if entry % 2 == 0 else arrs[idx][::-1]
+            chain.append(a)
+            exit_end = entry ^ 1
+            if exit_end not in link:
+                break
+            nxt = link[exit_end]
+            idx, entry = nxt // 2, nxt
+        result.append(_as_list(np.vstack(chain)))
+    return result
+
+
 def filter_short_strokes(strokes: List[StrokeF], min_length: float) -> List[StrokeF]:
     return [s for s in strokes if stroke_length(s) >= min_length]
 

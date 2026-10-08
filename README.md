@@ -32,6 +32,7 @@ traslados con el lápiz arriba); simulación de lo que dibujará el robot.*
 ├── visualization/visualize.py   imágenes de cada etapa
 ├── matlab/cargar_trayectoria.m  lectura del CSV + IK de ejemplo
 ├── tests/                  pruebas (python -m pytest tests/)
+├── models/                 detector de caras YuNet (230 KB, licencia MIT)
 ├── input/                  imágenes de entrada
 ├── docs/                   figuras de validación
 ├── V1/                     resultados y README de la V1 (solo referencia)
@@ -49,7 +50,7 @@ Al validarla con fotos de caras se encontraron estos problemas:
 |---|---|---|
 | La foto se vuelve manchas blancas y negras (traje, pelo, sombras) | El threshold global (Otsu) separa regiones claras y oscuras, no líneas | **XDoG** (diferencia de Gaussianas): responde a líneas y rasgos finos, no a regiones |
 | El skeleton dibuja el "eje medio" de las manchas, que es una red de líneas sin sentido | Skeleton aplicado a regiones gruesas | Skeleton solo sobre líneas finas |
-| El fondo (cortinas, banderas, paredes) se dibuja igual que la cara | No hay noción de persona/fondo | **Detección de cara** (Haar) + recorte + **GrabCut** para eliminar el fondo, sea del color que sea |
+| El fondo (cortinas, banderas, paredes) se dibuja igual que la cara | No hay noción de persona/fondo | **Detección de cara** (YuNet) + recorte + **GrabCut** para eliminar el fondo, sea del color que sea |
 | Con luz lateral o fotos oscuras el resultado cambia por completo | Umbral fijo frente a la iluminación | **Normalización de iluminación**: flat-field + CLAHE, y umbral por percentil |
 | Ojos, nariz y boca apenas aparecen | El pelo y la ropa "se comen" las líneas | **Umbral propio** para la zona de rasgos (`FACE_FEATURE_BOOST`) |
 | Strokes de cientos de mm y puntos separados por muchos mm | Solo se simplificaba con RDP | `robot_path`: longitud máxima por stroke y distancia máxima entre waypoints |
@@ -69,12 +70,14 @@ source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> Usar **OpenCV 4.x** (`<5.0`): la 5.0 ya no trae los modelos Haar de
-> detección de cara.
+> Usar **OpenCV 4.x** (`<5.0`). La detección principal usa YuNet
+> (`cv2.FaceDetectorYN`, modelo incluido en `models/`); como respaldo usa
+> los modelos Haar, que la 5.0 ya no incluye.
 
 En **Raspberry Pi** (Raspberry Pi OS de 64 bits) basta con lo mismo, porque
-`opencv-python-headless` publica wheels para aarch64. El pipeline no usa
-redes neuronales. En una PC tarda de 0.6 a 2 s por foto; en una Pi 4/5
+`opencv-python-headless` publica wheels para aarch64. La única red neuronal
+es YuNet, un detector de caras muy ligero pensado para dispositivos como la
+Pi. En una PC tarda de 0.6 a 2 s por foto; en una Pi 4/5
 se esperan unos segundos (no se ha medido aún).
 
 ---
@@ -125,16 +128,17 @@ python main.py --input input/dibujo_casa.png --mode drawing --method all
 
 | # | Etapa | Módulo | Imagen de salida |
 |---|---|---|---|
-| 1 | Detección de la cara más grande (Haar frontal → perfil) | `face.detect_face` | `02_face_detection.png` |
-| 2 | Recorte cabeza+cuello y escalado a 600 px de alto | `face.crop_portrait` | `03_crop.png` |
+| 1 | Detección de la cara más grande y de 5 puntos (ojos, nariz, comisuras) con YuNet; Haar de respaldo | `face.detect_face` | `02_face_detection.png` |
+| 2 | Recorte cabeza+cuello y escalado a 600 px de alto; zonas de rasgos y ojos según los puntos (siguen la inclinación de la cabeza) | `face.crop_portrait`, `face.feature_zones` | `03_crop.png` |
 | 3 | Persona vs fondo (GrabCut inicializado con la cara) | `face.segment_foreground` | `04_foreground.png` |
 | 4 | Iluminación uniforme (flat-field + CLAHE) | `face.normalize_illumination` | `05_illumination.png` |
-| 5 | Líneas XDoG + silueta + limpieza | `face.extract_line_mask` | `06_lines.png` |
+| 5 | Líneas XDoG (umbral propio en rasgos y ojos) + silueta + relleno de reflejos + limpieza | `face.extract_line_mask`, `face.fill_small_holes` | `06_lines.png` |
 | 6 | Skeleton → strokes en px | `skeleton.py` | `07_skeleton.png`, `08_strokes.png` |
 | 7 | Trayectoria del robot (ver §5) | `robot_path.py` | `09_robot_path.png`, `10_final_trajectory.png` |
 
-Si no se detecta ninguna cara, se usa la imagen completa sin eliminar el
-fondo y se imprime un aviso.
+Si no se detecta ninguna cara, el programa **se detiene con un error** en
+lugar de dibujar la escena completa (lámparas, muebles...). Con
+`--allow-no-face` se usa la imagen completa.
 
 Si el resultado no se ve bien, revisa las imágenes en orden para ubicar en
 qué etapa se degrada.
@@ -147,20 +151,25 @@ Con IK el controlador solo recibe los waypoints y entre dos de ellos
 interpola, normalmente en espacio articular. **Entre dos puntos lejanos esa
 interpolación no es una recta en el papel.** Por eso:
 
-1. **Suavizado** (`SMOOTH_WINDOW_PX`): quita el escalón de píxel del
+1. **Unión de guiones** (`LINK_GAP_PX`, `LINK_MAX_ANGLE_DEG`): si el final
+   de un stroke apunta al inicio de otro, se unen y el hueco se dibuja. El
+   pelo y el contorno salen como líneas continuas y no como guiones, con
+   muchas menos subidas de lápiz.
+2. **Suavizado** (`SMOOTH_WINDOW_PX`): quita el escalón de píxel del
    skeleton, que haría vibrar el brazo.
-2. **Orden + unión** (vecino más cercano, invirtiendo strokes cuando
+3. **Orden + unión** (vecino más cercano, invirtiendo strokes cuando
    conviene): reduce los traslados con el lápiz arriba y une strokes cuyos
    extremos casi se tocan (`JOIN_GAP_PX`).
-3. **px → mm** con escala uniforme, centrado en el área, Y hacia arriba y
+4. **px → mm** con escala uniforme, centrado en el área, Y hacia arriba y
    origen configurable (`DRAWING_ORIGIN_MM`) para que las coordenadas ya
    queden en el marco del robot.
-4. **Descarte** de strokes < `MIN_STROKE_LENGTH_MM` (ruido que solo cuesta
-   subidas de lápiz).
-5. **RDP en mm** (`ROBOT_SIMPLIFY_EPSILON_MM`).
-6. **Strokes cortos**: los mayores a `MAX_STROKE_LENGTH_MM` se parten. El
+5. **Descarte** de strokes < `MIN_STROKE_LENGTH_MM` en la zona de rasgos y
+   < `MIN_STROKE_LENGTH_OUTSIDE_MM` fuera de ella (pelo, mejillas): un trazo
+   suelto corto fuera de la cara casi siempre es textura.
+6. **RDP en mm** (`ROBOT_SIMPLIFY_EPSILON_MM`).
+7. **Strokes cortos**: los mayores a `MAX_STROKE_LENGTH_MM` se parten. El
    tramo siguiente empieza exactamente donde terminó el anterior.
-7. **Densificación**: ningún segmento mide más de `MAX_SEGMENT_MM`.
+8. **Densificación**: ningún segmento mide más de `MAX_SEGMENT_MM`.
 
 Al final se imprime un resumen para validar antes de dibujar: strokes,
 waypoints, segmento y stroke más largos, caja envolvente en mm y tiempo
@@ -213,7 +222,10 @@ la visión y el control.
 | Parámetro | Default | Efecto |
 |---|---|---|
 | `LINE_PERCENTILE` (`--detail`) | 7 | Cantidad de líneas. Más = más detalle y más tiempo |
-| `FACE_FEATURE_BOOST` | 1.8 | Detalle extra en ojos/nariz/boca respecto al resto |
+| `FACE_FEATURE_BOOST` | 1.8 | Detalle extra en cejas/ojos/nariz/boca respecto al resto |
+| `FACE_EYE_BOOST` | 3.0 | Detalle extra alrededor de cada ojo (útil con lentes) |
+| `FACE_REQUIRED` (`--allow-no-face`) | True | Error si no hay cara, en vez de dibujar toda la imagen |
+| `LINK_GAP_PX`, `LINK_MAX_ANGLE_DEG` | 12 px, 30° | Unión de líneas en guiones. Subir = menos strokes, con riesgo de unir líneas distintas |
 | `XDOG_SIGMA` | 1.6 | Escala de los rasgos. Más alto = líneas más gruesas y menos detalle fino |
 | `FACE_CROP_MARGINS` | (0.55, 0.55, 0.65, 0.55) | Cuánto de pelo/hombros entra en el recorte |
 | `FACE_DRAW_OUTLINE` | True | Dibujar la silueta de la persona |
@@ -221,7 +233,8 @@ la visión y el control.
 | `DRAWING_ORIGIN_MM`, `FLIP_Y` | (0,0), True | Marco de coordenadas del robot |
 | `MAX_STROKE_LENGTH_MM` | 30 | Longitud máxima de un stroke |
 | `MAX_SEGMENT_MM` | 1.0 | Distancia máxima entre waypoints |
-| `MIN_STROKE_LENGTH_MM` | 1.5 | Filtro de ruido |
+| `MIN_STROKE_LENGTH_MM` | 1.5 | Filtro de ruido en la zona de rasgos |
+| `MIN_STROKE_LENGTH_OUTSIDE_MM` | 4.0 | Filtro de ruido fuera de la cara (pelo, ropa) |
 | `PEN_*_SPEED`, `PEN_LIFT_TIME_S` | 20, 50 mm/s; 0.6 s | Solo para estimar el tiempo |
 
 ---
@@ -232,17 +245,20 @@ Se probaron 5 retratos con fondos distintos (cortinas rojas y bandera, fondo
 gris liso, pared con textura, cortina azul, interior) en 3 variantes de
 iluminación cada uno: normal, **oscura** (gamma 2.2 × 0.55 + ruido) y
 **lateral** (gradiente 0.2 → 1.25 de izquierda a derecha). Son 15 imágenes,
-más una sin cara.
+más una sin cara. Después se agregaron 2 fotos reales del equipo: un retrato
+de frente con lentes y una selfie en espejo con la cabeza inclinada unos 25°
+y la cara parcialmente tapada por el celular. Con Haar, la selfie no se
+detectaba y se dibujaba toda la escena; con YuNet sí se detecta.
 
-- Se detectó la cara en las 15 imágenes con cara. La imagen sin cara cae
-  correctamente al modo de imagen completa.
-- En las 15 imágenes: segmento máximo ≤ 1.00 mm, stroke máximo ≤ 30 mm y
-  todo dentro del área. Cada retrato da entre 76 y 132 strokes y entre
-  980 y 1300 waypoints, con 1.5 a 2.3 min de dibujo estimados. El
-  procesamiento tarda de 0.6 a 2 s por foto en una PC.
+- Se detectó la cara en las 17 imágenes con cara. La imagen sin cara se
+  detiene con un mensaje claro.
+- En las 17 imágenes: segmento máximo ≤ 1.00 mm, stroke máximo ≤ 30 mm y
+  todo dentro del área. Cada retrato da entre 46 y 78 strokes (antes de unir
+  los guiones eran entre 76 y 132), con 1.1 a 1.7 min de dibujo estimados.
+  El procesamiento tarda de 0.6 a 2 s por foto en una PC.
 - Las variantes oscura y lateral producen dibujos casi iguales a la normal.
 - El resultado es determinista (misma foto, mismo CSV).
-- Pruebas unitarias de `robot_path`: `python -m pytest tests/`.
+- Pruebas unitarias: `python -m pytest tests/`.
 
 ---
 
@@ -253,10 +269,13 @@ más una sin cara.
   con luz fuerte): GrabCut puede dejar un trozo de fondo pegado a la cabeza,
   que aparece en la silueta. En ese caso usar `--no-outline`, o mejor,
   fotografiar sobre un fondo que contraste.
-- **Caras de perfil o muy giradas**: la cascada de perfil ayuda, pero la
-  detección es menos fiable que de frente.
-- **Pelo con mucha textura** genera muchos strokes cortos. Bajar `--detail`
-  o subir `--min-stroke-mm` si el tiempo de dibujo es excesivo.
+- **Caras de perfil completo**: YuNet tolera inclinación y giros moderados,
+  pero de perfil completo puede no detectar la cara. En ese caso las zonas
+  de rasgos quedan menos precisas.
+- **Objetos pegados a la persona** (celular en la mano, micrófono): si
+  GrabCut los toma como parte de la persona, se dibujan.
+- **Pelo con mucha textura**: si aun así salen demasiados trazos, bajar
+  `--detail` o subir `MIN_STROKE_LENGTH_OUTSIDE_MM`.
 - El estilo es de **contorno/boceto**, no de sombreado (no hay hatching).
 - La IK de MATLAB es un ejemplo: el código no se ejecutó en MATLAB dentro
   de este proyecto.

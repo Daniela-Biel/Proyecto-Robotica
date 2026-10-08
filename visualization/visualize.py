@@ -139,16 +139,33 @@ def draw_robot_path(
 
 
 def draw_face_detection(image: np.ndarray, face, crop_rect) -> np.ndarray:
-    """Original con el rectangulo de la cara (verde) y del recorte (azul)."""
+    """Original con la caja de la cara (verde), sus 5 puntos (rojo) y el
+    recorte (azul)."""
     canvas = _ensure_bgr(image)
     t = max(2, image.shape[0] // 300)
-    if crop_rect is not None:
+    if face is not None:
         x, y, w, h = crop_rect
         cv2.rectangle(canvas, (x, y), (x + w, y + h), (255, 128, 0), t)
-    if face is not None:
-        x, y, w, h = face
+        x, y, w, h = face.rect
         cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 0), t)
+        if face.landmarks is not None:
+            for px, py in face.landmarks:
+                cv2.circle(canvas, (int(px), int(py)), 2 * t, (0, 0, 255), -1)
     else:
         cv2.putText(canvas, "SIN CARA DETECTADA", (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
                     1.0, (0, 0, 255), 2)
+    return canvas
+
+
+def draw_face_zones(crop: np.ndarray, face) -> np.ndarray:
+    """Recorte con las zonas de detalle: rasgos (amarillo) y ojos (magenta)."""
+    from image_processing.face import feature_zones
+
+    canvas = _ensure_bgr(crop)
+    if face is None:
+        return canvas
+    features, eyes = feature_zones(face, crop.shape[:2])
+    for mask, color in ((features, (0, 220, 255)), (eyes, (255, 0, 255))):
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(canvas, contours, -1, color, 1, cv2.LINE_AA)
     return canvas
